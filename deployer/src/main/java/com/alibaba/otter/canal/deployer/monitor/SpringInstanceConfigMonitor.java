@@ -13,7 +13,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang.StringUtils;
-import org.apache.commons.lang.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.Assert;
@@ -49,6 +48,12 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
     private ScheduledExecutorService         executor             = Executors.newScheduledThreadPool(1,
                                                                       new NamedThreadFactory("canal-instance-scan"));
 
+    private volatile boolean                 isFirst              = true;
+
+    public Map<String, InstanceAction> getActions() {
+        return actions;
+    }
+
     public void start() {
         super.start();
         Assert.notNull(rootConf, "root conf dir is null!");
@@ -58,6 +63,9 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
             public void run() {
                 try {
                     scan();
+                    if (isFirst) {
+                        isFirst = false;
+                    }
                 } catch (Throwable e) {
                     logger.error("scan failed", e);
                 }
@@ -122,13 +130,18 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
 
             if (!actions.containsKey(destination) && instanceConfigs.length > 0) {
                 // 存在合法的instance.properties，并且第一次添加时，进行启动操作
-                notifyStart(instanceDir, destination);
+                notifyStart(instanceDir, destination, instanceConfigs);
             } else if (actions.containsKey(destination)) {
                 // 历史已经启动过
                 if (instanceConfigs.length == 0) { // 如果不存在合法的instance.properties
                     notifyStop(destination);
                 } else {
                     InstanceConfigFiles lastFile = lastFiles.get(destination);
+                    // 历史启动过 所以配置文件信息必然存在
+                    if (!isFirst && CollectionUtils.isEmpty(lastFile.getInstanceFiles())) {
+                        logger.error("[{}] is started, but not found instance file info.", destination);
+                    }
+
                     boolean hasChanged = judgeFileChanged(instanceConfigs, lastFile.getInstanceFiles());
                     // 通知变化
                     if (hasChanged) {
@@ -161,24 +174,33 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
         }
     }
 
-    private void notifyStart(File instanceDir, String destination) {
+    private void notifyStart(File instanceDir, String destination, File[] instanceConfigs) {
         try {
             defaultAction.start(destination);
             actions.put(destination, defaultAction);
-            logger.info("auto notify start {} successful.", destination);
+
+            // 启动成功后记录配置文件信息
+            InstanceConfigFiles lastFile = lastFiles.get(destination);
+            List<FileInfo> newFileInfo = new ArrayList<FileInfo>();
+            for (File instanceConfig : instanceConfigs) {
+                newFileInfo.add(new FileInfo(instanceConfig.getName(), instanceConfig.lastModified()));
+            }
+            lastFile.setInstanceFiles(newFileInfo);
         } catch (Throwable e) {
-            logger.error("scan add found[{}] but start failed", destination, ExceptionUtils.getFullStackTrace(e));
+            logger.error(String.format("scan add found[%s] but start failed", destination), e);
         }
     }
 
     private void notifyStop(String destination) {
         InstanceAction action = actions.remove(destination);
-        try {
-            action.stop(destination);
-            logger.info("auto notify stop {} successful.", destination);
-        } catch (Throwable e) {
-            logger.error("scan delete found[{}] but stop failed", destination, ExceptionUtils.getFullStackTrace(e));
-            actions.put(destination, action);// 再重新加回去，下一次scan时再执行删除
+        if (action != null) {
+            try {
+                action.stop(destination);
+                lastFiles.remove(destination);
+            } catch (Throwable e) {
+                logger.error(String.format("scan delete found[%s] but stop failed", destination), e);
+                actions.put(destination, action);// 再重新加回去，下一次scan时再执行删除
+            }
         }
     }
 
@@ -187,11 +209,8 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
         if (action != null) {
             try {
                 action.reload(destination);
-                logger.info("auto notify reload {} successful.", destination);
             } catch (Throwable e) {
-                logger.error("scan reload found[{}] but reload failed",
-                    destination,
-                    ExceptionUtils.getFullStackTrace(e));
+                logger.error(String.format("scan reload found[%s] but reload failed", destination), e);
             }
         }
     }
@@ -294,5 +313,4 @@ public class SpringInstanceConfigMonitor extends AbstractCanalLifeCycle implemen
         }
 
     }
-
 }

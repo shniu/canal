@@ -1,12 +1,18 @@
 package com.alibaba.otter.canal.instance.manager;
 
+import java.io.File;
+import java.io.FilenameFilter;
 import java.net.InetSocketAddress;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.CollectionUtils;
@@ -17,8 +23,7 @@ import com.alibaba.otter.canal.common.alarm.LogAlarmHandler;
 import com.alibaba.otter.canal.common.utils.JsonUtils;
 import com.alibaba.otter.canal.common.zookeeper.ZkClientx;
 import com.alibaba.otter.canal.filter.aviater.AviaterRegexFilter;
-import com.alibaba.otter.canal.instance.core.CanalInstance;
-import com.alibaba.otter.canal.instance.core.CanalInstanceSupport;
+import com.alibaba.otter.canal.instance.core.AbstractCanalInstance;
 import com.alibaba.otter.canal.instance.manager.model.Canal;
 import com.alibaba.otter.canal.instance.manager.model.CanalParameter;
 import com.alibaba.otter.canal.instance.manager.model.CanalParameter.DataSourcing;
@@ -28,7 +33,7 @@ import com.alibaba.otter.canal.instance.manager.model.CanalParameter.MetaMode;
 import com.alibaba.otter.canal.instance.manager.model.CanalParameter.SourcingType;
 import com.alibaba.otter.canal.instance.manager.model.CanalParameter.StorageMode;
 import com.alibaba.otter.canal.instance.manager.model.CanalParameter.StorageScavengeMode;
-import com.alibaba.otter.canal.meta.CanalMetaManager;
+import com.alibaba.otter.canal.meta.FileMixedMetaManager;
 import com.alibaba.otter.canal.meta.MemoryMetaManager;
 import com.alibaba.otter.canal.meta.PeriodMixedMetaManager;
 import com.alibaba.otter.canal.meta.ZooKeeperMetaManager;
@@ -39,6 +44,10 @@ import com.alibaba.otter.canal.parse.inbound.AbstractEventParser;
 import com.alibaba.otter.canal.parse.inbound.group.GroupEventParser;
 import com.alibaba.otter.canal.parse.inbound.mysql.LocalBinlogEventParser;
 import com.alibaba.otter.canal.parse.inbound.mysql.MysqlEventParser;
+import com.alibaba.otter.canal.parse.inbound.mysql.rds.RdsBinlogEventParserProxy;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.DefaultTableMetaTSDBFactory;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDB;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDBBuilder;
 import com.alibaba.otter.canal.parse.index.CanalLogPositionManager;
 import com.alibaba.otter.canal.parse.index.FailbackLogPositionManager;
 import com.alibaba.otter.canal.parse.index.MemoryLogPositionManager;
@@ -46,42 +55,24 @@ import com.alibaba.otter.canal.parse.index.MetaLogPositionManager;
 import com.alibaba.otter.canal.parse.index.PeriodMixedLogPositionManager;
 import com.alibaba.otter.canal.parse.index.ZooKeeperLogPositionManager;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
-import com.alibaba.otter.canal.protocol.CanalEntry.Entry;
-import com.alibaba.otter.canal.protocol.ClientIdentity;
 import com.alibaba.otter.canal.protocol.position.EntryPosition;
-import com.alibaba.otter.canal.sink.CanalEventSink;
 import com.alibaba.otter.canal.sink.entry.EntryEventSink;
 import com.alibaba.otter.canal.sink.entry.group.GroupEventSink;
 import com.alibaba.otter.canal.store.AbstractCanalStoreScavenge;
-import com.alibaba.otter.canal.store.CanalEventStore;
 import com.alibaba.otter.canal.store.memory.MemoryEventStoreWithBuffer;
 import com.alibaba.otter.canal.store.model.BatchMode;
-import com.alibaba.otter.canal.store.model.Event;
 
 /**
  * 单个canal实例，比如一个destination会独立一个实例
- * 
+ *
  * @author jianghang 2012-7-11 下午09:26:51
  * @version 1.0.0
  */
-public class CanalInstanceWithManager extends CanalInstanceSupport implements CanalInstance {
+public class CanalInstanceWithManager extends AbstractCanalInstance {
 
-    private static final Logger           logger = LoggerFactory.getLogger(CanalInstanceWithManager.class);
-    protected Long                        canalId;                                                         // 和manager交互唯一标示
-    protected String                      destination;                                                     // 队列名字
-    protected String                      filter;                                                          // 过滤表达式
-    protected CanalParameter              parameters;                                                      // 对应参数
-    protected CanalMetaManager            metaManager;                                                     // 消费信息管理器
-    protected CanalEventStore<Event>      eventStore;                                                      // 有序队列
-
-    protected CanalEventParser            eventParser;                                                     // 解析对应的数据信息
-    protected CanalEventSink<List<Entry>> eventSink;                                                       // 链接parse和store的桥接器
-    protected CanalAlarmHandler           alarmHandler;                                                    // alarm报警机制
-    protected ZkClientx                   zkClientx;
-
-    public CanalInstanceWithManager(Canal canal){
-        this(canal, null);
-    }
+    private static final Logger logger = LoggerFactory.getLogger(CanalInstanceWithManager.class);
+    protected String            filter;                                                          // 过滤表达式
+    protected CanalParameter    parameters;                                                      // 对应参数
 
     public CanalInstanceWithManager(Canal canal, String filter){
         this.parameters = canal.getCanalParameter();
@@ -89,7 +80,7 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
         this.destination = canal.getName();
         this.filter = filter;
 
-        logger.info("init CannalInstance for {}-{} with parameters:{}", canalId, destination, parameters);
+        logger.info("init CanalInstance for {}-{} with parameters:{}", canalId, destination, parameters);
         // 初始化报警机制
         initAlarmHandler();
         // 初始化metaManager
@@ -101,7 +92,7 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
         // 初始化eventParser;
         initEventParser();
 
-        // 基础工具，需要提前start，会有先订阅再根据filter条件启动paser的需求
+        // 基础工具，需要提前start，会有先订阅再根据filter条件启动parse的需求
         if (!alarmHandler.isStart()) {
             alarmHandler.start();
         }
@@ -113,103 +104,50 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
     }
 
     public void start() {
-        super.start();
         // 初始化metaManager
         logger.info("start CannalInstance for {}-{} with parameters:{}", canalId, destination, parameters);
-
-        if (!metaManager.isStart()) {
-            metaManager.start();
-        }
-
-        if (!alarmHandler.isStart()) {
-            alarmHandler.start();
-        }
-
-        if (!eventStore.isStart()) {
-            eventStore.start();
-        }
-
-        if (!eventSink.isStart()) {
-            eventSink.start();
-        }
-
-        if (!eventParser.isStart()) {
-            beforeStartEventParser(eventParser);
-            eventParser.start();
-        }
-
-        logger.info("start successful....");
+        super.start();
     }
 
-    public void stop() {
-        logger.info("stop CannalInstance for {}-{} ", new Object[] { canalId, destination });
-
-        if (eventParser.isStart()) {
-            eventParser.stop();
-            afterStopEventParser(eventParser);
-        }
-
-        if (eventSink.isStart()) {
-            eventSink.stop();
-        }
-
-        if (eventStore.isStart()) {
-            eventStore.stop();
-        }
-
-        if (metaManager.isStart()) {
-            metaManager.stop();
-        }
-
-        if (alarmHandler.isStart()) {
-            alarmHandler.stop();
-        }
-
-        // if (zkClientx != null) {
-        // zkClientx.close();
-        // }
-
-        super.stop();
-        logger.info("stop successful....");
-    }
-
-    public boolean subscribeChange(ClientIdentity identity) {
-        if (StringUtils.isNotEmpty(identity.getFilter())) {
-            AviaterRegexFilter aviaterFilter = new AviaterRegexFilter(identity.getFilter());
-
-            boolean isGroup = (eventParser instanceof GroupEventParser);
-            if (isGroup) {
-                // 处理group的模式
-                List<CanalEventParser> eventParsers = ((GroupEventParser) eventParser).getEventParsers();
-                for (CanalEventParser singleEventParser : eventParsers) {// 需要遍历启动
-                    ((AbstractEventParser) singleEventParser).setEventFilter(aviaterFilter);
-                }
-            } else {
-                ((AbstractEventParser) eventParser).setEventFilter(aviaterFilter);
-            }
-
-        }
-
-        // filter的处理规则
-        // a. parser处理数据过滤处理
-        // b. sink处理数据的路由&分发,一份parse数据经过sink后可以分发为多份，每份的数据可以根据自己的过滤规则不同而有不同的数据
-        // 后续内存版的一对多分发，可以考虑
-        return true;
-    }
-
-    protected void afterStartEventParser(CanalEventParser eventParser) {
-        super.afterStartEventParser(eventParser);
-
-        // 读取一下历史订阅的filter信息
-        List<ClientIdentity> clientIdentitys = metaManager.listAllSubscribeInfo(destination);
-        for (ClientIdentity clientIdentity : clientIdentitys) {
-            subscribeChange(clientIdentity);
-        }
-    }
-
+    @SuppressWarnings("resource")
     protected void initAlarmHandler() {
         logger.info("init alarmHandler begin...");
-        alarmHandler = new LogAlarmHandler();
+        String alarmHandlerClass = parameters.getAlarmHandlerClass();
+        String alarmHandlerPluginDir = parameters.getAlarmHandlerPluginDir();
+        if (alarmHandlerClass == null || alarmHandlerPluginDir == null) {
+            alarmHandler = new LogAlarmHandler();
+        } else {
+            try {
+                File externalLibDir = new File(alarmHandlerPluginDir);
+                File[] jarFiles = externalLibDir.listFiles(new FilenameFilter() {
+
+                    @Override
+                    public boolean accept(File dir, String name) {
+                        return name.endsWith(".jar");
+                    }
+                });
+                if (jarFiles == null || jarFiles.length == 0) {
+                    throw new IllegalStateException(String.format("alarmHandlerPluginDir [%s] can't find any name endswith \".jar\" file.",
+                        alarmHandlerPluginDir));
+                }
+                URL[] urls = new URL[jarFiles.length];
+                for (int i = 0; i < jarFiles.length; i++) {
+                    urls[i] = jarFiles[i].toURI().toURL();
+                }
+                ClassLoader currentClassLoader = new URLClassLoader(urls,
+                    CanalInstanceWithManager.class.getClassLoader());
+                Class<CanalAlarmHandler> _alarmClass = (Class<CanalAlarmHandler>) currentClassLoader.loadClass(alarmHandlerClass);
+                alarmHandler = _alarmClass.newInstance();
+                logger.info("init [{}] alarm handler success.", alarmHandlerClass);
+            } catch (Throwable e) {
+                String errorMsg = String.format("init alarmHandlerPluginDir [%s] alarm handler [%s] error: %s",
+                    alarmHandlerPluginDir,
+                    alarmHandlerClass,
+                    ExceptionUtils.getFullStackTrace(e));
+                logger.error(errorMsg);
+                throw new CanalException(errorMsg, e);
+            }
+        }
         logger.info("init alarmHandler end! \n\t load CanalAlarmHandler:{} ", alarmHandler.getClass().getName());
     }
 
@@ -229,6 +167,11 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
             ZooKeeperMetaManager zooKeeperMetaManager = new ZooKeeperMetaManager();
             zooKeeperMetaManager.setZkClientx(getZkclientx());
             ((PeriodMixedMetaManager) metaManager).setZooKeeperMetaManager(zooKeeperMetaManager);
+        } else if (mode.isLocalFile()) {
+            FileMixedMetaManager fileMixedMetaManager = new FileMixedMetaManager();
+            fileMixedMetaManager.setDataDir(parameters.getDataDir());
+            fileMixedMetaManager.setPeriod(parameters.getMetaFileFlushPeriod());
+            metaManager = fileMixedMetaManager;
         } else {
             throw new CanalException("unsupport MetaMode for " + mode);
         }
@@ -245,6 +188,7 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
             memoryEventStore.setBufferMemUnit(parameters.getMemoryStorageBufferMemUnit());
             memoryEventStore.setBatchMode(BatchMode.valueOf(parameters.getStorageBatchMode().name()));
             memoryEventStore.setDdlIsolation(parameters.getDdlIsolation());
+            memoryEventStore.setRaw(parameters.getMemoryStorageRawEntry());
             eventStore = memoryEventStore;
         } else if (mode.isFile()) {
             // 后续版本支持
@@ -336,7 +280,18 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
     private CanalEventParser doInitEventParser(SourcingType type, List<InetSocketAddress> dbAddresses) {
         CanalEventParser eventParser;
         if (type.isMysql()) {
-            MysqlEventParser mysqlEventParser = new MysqlEventParser();
+            MysqlEventParser mysqlEventParser = null;
+            if (StringUtils.isNotEmpty(parameters.getRdsAccesskey())
+                && StringUtils.isNotEmpty(parameters.getRdsSecretkey())
+                && StringUtils.isNotEmpty(parameters.getRdsInstanceId())) {
+
+                mysqlEventParser = new RdsBinlogEventParserProxy();
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setAccesskey(parameters.getRdsAccesskey());
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setSecretkey(parameters.getRdsSecretkey());
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setInstanceId(parameters.getRdsInstanceId());
+            } else {
+                mysqlEventParser = new MysqlEventParser();
+            }
             mysqlEventParser.setDestination(destination);
             // 编码参数
             mysqlEventParser.setConnectionCharset(Charset.forName(parameters.getConnectionCharset()));
@@ -372,7 +327,7 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
                 mysqlEventParser.setMasterPosition(masterPosition);
 
                 if (parameters.getPositions().size() > 1) {
-                    EntryPosition standbyPosition = JsonUtils.unmarshalFromString(parameters.getPositions().get(0),
+                    EntryPosition standbyPosition = JsonUtils.unmarshalFromString(parameters.getPositions().get(1),
                         EntryPosition.class);
                     mysqlEventParser.setStandbyPosition(standbyPosition);
                 }
@@ -380,6 +335,41 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
             mysqlEventParser.setFallbackIntervalInSeconds(parameters.getFallbackIntervalInSeconds());
             mysqlEventParser.setProfilingEnabled(false);
             mysqlEventParser.setFilterTableError(parameters.getFilterTableError());
+            mysqlEventParser.setParallel(parameters.getParallel());
+            mysqlEventParser.setIsGTIDMode(BooleanUtils.toBoolean(parameters.getGtidEnable()));
+            // tsdb
+            if (parameters.getTsdbSnapshotInterval() != null) {
+                mysqlEventParser.setTsdbSnapshotInterval(parameters.getTsdbSnapshotInterval());
+            }
+            if (parameters.getTsdbSnapshotExpire() != null) {
+                mysqlEventParser.setTsdbSnapshotExpire(parameters.getTsdbSnapshotExpire());
+            }
+            boolean tsdbEnable = BooleanUtils.toBoolean(parameters.getTsdbEnable());
+            if (tsdbEnable) {
+                mysqlEventParser.setTableMetaTSDBFactory(new DefaultTableMetaTSDBFactory() {
+
+                    @Override
+                    public void destory(String destination) {
+                        TableMetaTSDBBuilder.destory(destination);
+                    }
+
+                    @Override
+                    public TableMetaTSDB build(String destination, String springXml) {
+                        try {
+                            System.setProperty("canal.instance.tsdb.url", parameters.getTsdbJdbcUrl());
+                            System.setProperty("canal.instance.tsdb.dbUsername", parameters.getTsdbJdbcUserName());
+                            System.setProperty("canal.instance.tsdb.dbPassword", parameters.getTsdbJdbcPassword());
+
+                            return TableMetaTSDBBuilder.build(destination, "classpath:spring/tsdb/mysql-tsdb.xml");
+                        } finally {
+                            System.setProperty("canal.instance.tsdb.url", "");
+                            System.setProperty("canal.instance.tsdb.dbUsername", "");
+                            System.setProperty("canal.instance.tsdb.dbPassword", "");
+                        }
+                    }
+                });
+                mysqlEventParser.setEnableTsdb(tsdbEnable);
+            }
             eventParser = mysqlEventParser;
         } else if (type.isLocalBinlog()) {
             LocalBinlogEventParser localBinlogEventParser = new LocalBinlogEventParser();
@@ -392,14 +382,15 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
             localBinlogEventParser.setDetectingEnable(parameters.getDetectingEnable());
             localBinlogEventParser.setDetectingIntervalInSeconds(parameters.getDetectingIntervalInSeconds());
             localBinlogEventParser.setFilterTableError(parameters.getFilterTableError());
+            localBinlogEventParser.setParallel(parameters.getParallel());
             // 数据库信息，反查表结构时需要
             if (!CollectionUtils.isEmpty(dbAddresses)) {
                 localBinlogEventParser.setMasterInfo(new AuthenticationInfo(dbAddresses.get(0),
                     parameters.getDbUsername(),
                     parameters.getDbPassword(),
                     parameters.getDefaultDatabaseName()));
-
             }
+
             eventParser = localBinlogEventParser;
         } else if (type.isOracle()) {
             throw new CanalException("unsupport SourcingType for " + type);
@@ -455,29 +446,24 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
     protected CanalLogPositionManager initLogPositionManager() {
         logger.info("init logPositionPersistManager begin...");
         IndexMode indexMode = parameters.getIndexMode();
-        CanalLogPositionManager logPositionManager = null;
+        CanalLogPositionManager logPositionManager;
         if (indexMode.isMemory()) {
             logPositionManager = new MemoryLogPositionManager();
         } else if (indexMode.isZookeeper()) {
-            logPositionManager = new ZooKeeperLogPositionManager();
-            ((ZooKeeperLogPositionManager) logPositionManager).setZkClientx(getZkclientx());
+            logPositionManager = new ZooKeeperLogPositionManager(getZkclientx());
         } else if (indexMode.isMixed()) {
-            logPositionManager = new PeriodMixedLogPositionManager();
-
-            ZooKeeperLogPositionManager zooKeeperLogPositionManager = new ZooKeeperLogPositionManager();
-            zooKeeperLogPositionManager.setZkClientx(getZkclientx());
-            ((PeriodMixedLogPositionManager) logPositionManager).setZooKeeperLogPositionManager(zooKeeperLogPositionManager);
+            MemoryLogPositionManager memoryLogPositionManager = new MemoryLogPositionManager();
+            ZooKeeperLogPositionManager zooKeeperLogPositionManager = new ZooKeeperLogPositionManager(getZkclientx());
+            logPositionManager = new PeriodMixedLogPositionManager(memoryLogPositionManager,
+                zooKeeperLogPositionManager,
+                1000L);
         } else if (indexMode.isMeta()) {
-            logPositionManager = new MetaLogPositionManager();
-            ((MetaLogPositionManager) logPositionManager).setMetaManager(metaManager);
+            logPositionManager = new MetaLogPositionManager(metaManager);
         } else if (indexMode.isMemoryMetaFailback()) {
-            MemoryLogPositionManager primaryLogPositionManager = new MemoryLogPositionManager();
-            MetaLogPositionManager failbackLogPositionManager = new MetaLogPositionManager();
-            failbackLogPositionManager.setMetaManager(metaManager);
+            MemoryLogPositionManager primary = new MemoryLogPositionManager();
+            MetaLogPositionManager secondary = new MetaLogPositionManager(metaManager);
 
-            logPositionManager = new FailbackLogPositionManager();
-            ((FailbackLogPositionManager) logPositionManager).setPrimary(primaryLogPositionManager);
-            ((FailbackLogPositionManager) logPositionManager).setFailback(failbackLogPositionManager);
+            logPositionManager = new FailbackLogPositionManager(primary, secondary);
         } else {
             throw new CanalException("unsupport indexMode for " + indexMode);
         }
@@ -513,32 +499,6 @@ public class CanalInstanceWithManager extends CanalInstanceSupport implements Ca
         Collections.sort(zkClusters);
 
         return ZkClientx.getZkClient(StringUtils.join(zkClusters, ";"));
-    }
-
-    // =====================================
-
-    public String getDestination() {
-        return destination;
-    }
-
-    public CanalMetaManager getMetaManager() {
-        return metaManager;
-    }
-
-    public CanalEventStore<Event> getEventStore() {
-        return eventStore;
-    }
-
-    public CanalEventParser getEventParser() {
-        return eventParser;
-    }
-
-    public CanalEventSink<List<Entry>> getEventSink() {
-        return eventSink;
-    }
-
-    public CanalAlarmHandler getAlarmHandler() {
-        return alarmHandler;
     }
 
     public void setAlarmHandler(CanalAlarmHandler alarmHandler) {
